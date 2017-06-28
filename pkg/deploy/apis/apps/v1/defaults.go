@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"github.com/golang/glog"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -25,6 +26,7 @@ func defaultHookContainerName(hook *LifecycleHook, containerName string) {
 }
 
 func SetDefaults_DeploymentConfigSpec(obj *DeploymentConfigSpec) {
+	glog.Infof("\n\n\n\n\n\n\n\n\n\n================\n Triggers: %#v\n\n\n\n\n\n\n\n\n\n", obj.Triggers)
 	if obj.Triggers == nil {
 		obj.Triggers = []DeploymentTriggerPolicy{
 			{Type: DeploymentTriggerOnConfigChange},
