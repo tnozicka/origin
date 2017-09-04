@@ -125,7 +125,7 @@ func init() {
 			// (see https://github.com/openshift/origin/pull/14322#issuecomment-303968976)
 			// TODO: remove "delete" rule few releases after 3.6
 			rbac.NewRule("delete").Groups(kapiGroup).Resources("replicationcontrollers").RuleOrDie(),
-			rbac.NewRule("get", "list", "watch", "update").Groups(kapiGroup).Resources("replicationcontrollers").RuleOrDie(),
+			rbac.NewRule("get", "list", "watch", "patch", "update").Groups(kapiGroup).Resources("replicationcontrollers").RuleOrDie(),
 			eventsRule(),
 		},
 	})

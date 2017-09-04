@@ -13,6 +13,7 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
@@ -20,6 +21,8 @@ import (
 	"k8s.io/kubernetes/pkg/api/v1"
 	kcoreclient "k8s.io/kubernetes/pkg/client/clientset_generated/clientset/typed/core/v1"
 	kcorelisters "k8s.io/kubernetes/pkg/client/listers/core/v1"
+	"k8s.io/kubernetes/pkg/client/retry"
+	kcontroller "k8s.io/kubernetes/pkg/controller"
 
 	deployapi "github.com/openshift/origin/pkg/deploy/apis/apps"
 	deployutil "github.com/openshift/origin/pkg/deploy/util"
@@ -107,11 +110,12 @@ func (c *DeploymentController) handle(deployment *v1.ReplicationController, will
 	nextStatus := currentStatus
 
 	deployerPodName := deployutil.DeployerPodNameForDeployment(deployment.Name)
-	deployer, deployerErr := c.podLister.Pods(deployment.Namespace).Get(deployerPodName)
+	deployerPod, deployerErr := c.podLister.Pods(deployment.Namespace).Get(deployerPodName)
 	if deployerErr == nil {
-		nextStatus = c.nextStatus(deployer, deployment, updatedAnnotations)
+		nextStatus = c.nextStatus(currentStatus, deployerPod, deployment, updatedAnnotations)
 	}
 
+	var err error
 	switch currentStatus {
 	case deployapi.DeploymentStatusNew:
 		// If the deployment has been cancelled, don't create a deployer pod.
@@ -135,22 +139,81 @@ func (c *DeploymentController) handle(deployment *v1.ReplicationController, will
 			}
 
 			// Generate a deployer pod spec.
-			deployerPod, err := c.makeDeployerPod(deployment)
+			deployerPod, err = c.makeDeployerPod(deployment)
 			if err != nil {
 				return fatalError(fmt.Sprintf("couldn't make deployer pod for %q: %v", deployutil.LabelForDeploymentV1(deployment), err))
 			}
-			// Create the deployer pod.
-			deploymentPod, err := c.pn.Pods(deployment.Namespace).Create(deployerPod)
-			// Retry on error.
+
+			// We need to transition the deployment to "pending" to make sure we can't ever create the deployer pod twice.
+			// If we would fail to update phase after and the deployer pod would have gotten deleted in the meantime
+			// we would have recreated it here.
+			// The disadvantage is that if the Create call fails we will never create the deployer pod.
+			// (Not even in new reconciliation run. The deployment will be marked as "failed" after.)
+			// But better safe than sorry!
+
+			updatedAnnotations[deployapi.DeploymentPodAnnotation] = deployerPod.Name
+			updatedAnnotations[deployapi.DeploymentStatusAnnotation] = string(nextStatus)
+
+			encoder := kapi.Codecs.LegacyCodec(kapi.Registry.EnabledVersions()...)
+
+			oldDeployment, err := deployutil.DeploymentDeepCopyV1(deployment)
 			if err != nil {
-				// if we cannot create a deployment pod (i.e lack of quota), match normal replica set experience and
-				// emit an event.
-				c.emitDeploymentEvent(deployment, v1.EventTypeWarning, "FailedCreate", fmt.Sprintf("Error creating deployer pod: %v", err))
-				return actionableError(fmt.Sprintf("couldn't create deployer pod for %q: %v", deployutil.LabelForDeploymentV1(deployment), err))
+				return err
 			}
-			updatedAnnotations[deployapi.DeploymentPodAnnotation] = deploymentPod.Name
-			nextStatus = deployapi.DeploymentStatusPending
-			glog.V(4).Infof("Created deployer pod %q for %q", deploymentPod.Name, deployutil.LabelForDeploymentV1(deployment))
+			// We need to make the patch contain UID to make sure we are patching the same deployment object
+			oldDeployment.UID = ""
+			// We need to make the patch contain resourceVersion to make sure we are acting
+			// on current representation of the object or leave it fail and requeue for the next pass
+			oldDeployment.ResourceVersion = ""
+
+			newDeployment, err := deployutil.DeploymentDeepCopyV1(deployment)
+			if err != nil {
+				return err
+			}
+			newDeployment.Annotations = updatedAnnotations
+
+			newDeploymentBytes, err := runtime.Encode(encoder, newDeployment)
+			if err != nil {
+				return err
+			}
+			oldDeploymentBytes, err := runtime.Encode(encoder, oldDeployment)
+			if err != nil {
+				return err
+			}
+
+			patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldDeploymentBytes, newDeploymentBytes, &v1.ReplicationController{})
+			if err != nil {
+				return err
+			}
+
+			deployment, err = c.rn.ReplicationControllers(deployment.Namespace).Patch(deployment.Name, types.StrategicMergePatchType, patchBytes)
+			if err != nil {
+				return err
+			}
+			glog.V(4).Infof("Updated rollout status for %q from %s to %s (scale: %d)", deployutil.LabelForDeploymentV1(deployment), currentStatus, nextStatus, deployment.Spec.Replicas)
+
+			// Create the deployer pod.
+			// We should try it multiple times to make the best effort to create it
+			// because there will no other chance to do it. See the above comment about
+			// preventing creating deployer pod multiple times.
+			attempt := 0
+			err = wait.ExponentialBackoff(retry.DefaultBackoff, func() (bool, error) {
+				attempt++
+				deployerPod, err = c.pn.Pods(deployment.Namespace).Create(deployerPod)
+				if err != nil && !kerrors.IsAlreadyExists(err) {
+					// If we cannot create a deployment pod (i.e lack of quota), match normal replica set experience and
+					// emit an event.
+					c.emitDeploymentEvent(deployment, v1.EventTypeWarning, "FailedCreate", fmt.Sprintf("Attempt #%d: error creating deployer pod: %v", attempt, err))
+					return false, nil
+				}
+				return true, nil
+			})
+			if err != nil {
+				glog.Error("couldn't create deployer pod for %q: %v", deployutil.LabelForDeploymentV1(deployment), err)
+			}
+
+			glog.V(4).Infof("Created deployer pod %q for %q", deployerPod.Name, deployutil.LabelForDeploymentV1(deployment))
+			currentStatus = nextStatus
 
 		// Most likely dead code since we never get an error different from 404 back from the cache.
 		case deployerErr != nil:
@@ -169,13 +232,15 @@ func (c *DeploymentController) handle(deployment *v1.ReplicationController, will
 			// to ensure that changes to 'unrelated' pods don't result in updates to
 			// the deployment. So, the image check will have to be done in other areas
 			// of the code as well.
-			if deployutil.DeploymentNameFor(deployer) != deployment.Name {
+			controllerRef := kcontroller.GetControllerOf(deployerPod)
+			if deployutil.DeploymentNameFor(deployerPod) != deployment.Name ||
+				(controllerRef != nil && controllerRef.UID != deployment.UID) {
 				nextStatus = deployapi.DeploymentStatusFailed
 				updatedAnnotations[deployapi.DeploymentStatusReasonAnnotation] = deployapi.DeploymentFailedUnrelatedDeploymentExists
-				c.emitDeploymentEvent(deployment, v1.EventTypeWarning, "FailedCreate", fmt.Sprintf("Error creating deployer pod since another pod with the same name (%q) exists", deployer.Name))
+				c.emitDeploymentEvent(deployment, v1.EventTypeWarning, "FailedCreate", fmt.Sprintf("Error creating deployer pod since another pod with the same name (%q) exists", deployerPod.Name))
 			} else {
 				// Update to pending or to the appropriate status relative to the existing validated deployer pod.
-				updatedAnnotations[deployapi.DeploymentPodAnnotation] = deployer.Name
+				updatedAnnotations[deployapi.DeploymentPodAnnotation] = deployerPod.Name
 				nextStatus = nextStatusComp(nextStatus, deployapi.DeploymentStatusPending)
 			}
 		}
@@ -274,7 +339,7 @@ func (c *DeploymentController) handle(deployment *v1.ReplicationController, will
 	return nil
 }
 
-func (c *DeploymentController) nextStatus(pod *v1.Pod, deployment *v1.ReplicationController, updatedAnnotations map[string]string) deployapi.DeploymentStatus {
+func (c *DeploymentController) nextStatus(current deployapi.DeploymentStatus, pod *v1.Pod, deployment *v1.ReplicationController, updatedAnnotations map[string]string) deployapi.DeploymentStatus {
 	switch pod.Status.Phase {
 	case v1.PodPending:
 		return deployapi.DeploymentStatusPending
@@ -299,8 +364,12 @@ func (c *DeploymentController) nextStatus(pod *v1.Pod, deployment *v1.Replicatio
 
 	case v1.PodFailed:
 		return deployapi.DeploymentStatusFailed
+
+	case v1.PodUnknown:
+		fallthrough
+	default:
+		return current
 	}
-	return deployapi.DeploymentStatusNew
 }
 
 func nextStatusComp(fromDeployer, fromPath deployapi.DeploymentStatus) deployapi.DeploymentStatus {

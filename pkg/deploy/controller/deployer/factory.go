@@ -68,6 +68,7 @@ func NewDeployerController(
 	})
 
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    c.addPod,
 		UpdateFunc: c.updatePod,
 		DeleteFunc: c.deletePod,
 	})
@@ -87,7 +88,7 @@ func (c *DeploymentController) Run(workers int, stopCh <-chan struct{}) {
 		return
 	}
 
-	glog.Infof("Deployer controller caches are synced. Starting workers.")
+	glog.Infof("Deployer controller caches are synced. Starting %d worker(s).", workers)
 
 	for i := 0; i < workers; i++ {
 		go wait.Until(c.worker, time.Second, stopCh)
@@ -122,6 +123,15 @@ func (c *DeploymentController) updateReplicationController(old, cur interface{})
 	}
 
 	c.enqueueReplicationController(curRC)
+}
+
+func (c *DeploymentController) addPod(obj interface{}) {
+	pod := obj.(*v1.Pod)
+
+	rc, err := c.rcForDeployerPod(pod)
+	if err == nil && rc != nil {
+		c.enqueueReplicationController(rc)
+	}
 }
 
 func (c *DeploymentController) updatePod(old, cur interface{}) {
