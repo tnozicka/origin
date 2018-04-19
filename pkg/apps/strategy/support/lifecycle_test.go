@@ -205,7 +205,16 @@ func TestHookExecutor_makeHookPodInvalidContainerRef(t *testing.T) {
 	}
 	deployment, _ := appsutil.MakeDeployment(config)
 
-	_, err := createHookPodManifest(hook, deployment, &strategy, "hook", nowFunc().Time)
+	_, err := createHookPodManifest(
+		hook,
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: appsutil.DeployerPodNameForDeployment(deployment.Name),
+			UID:  "",
+		}},
+		deployment,
+		&strategy,
+		"hook",
+		nowFunc().Time)
 	if err == nil {
 		t.Fatalf("expected an error")
 	}
@@ -502,7 +511,16 @@ func TestHookExecutor_makeHookPod(t *testing.T) {
 		if err := legacyscheme.Scheme.Convert(&config.Spec.Strategy, &newStrategy, nil); err != nil {
 			t.Fatalf("conversion error: %v", err)
 		}
-		pod, err := createHookPodManifest(test.hook, deployment, &newStrategy, "hook", nowFunc().Time)
+		pod, err := createHookPodManifest(
+			test.hook,
+			&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name: appsutil.DeployerPodNameForDeployment(deployment.Name),
+				UID:  "",
+			}},
+			deployment,
+			&newStrategy,
+			"hook",
+			nowFunc().Time)
 		if err != nil {
 			t.Fatalf("unexpected error: %s", err)
 		}
@@ -538,7 +556,16 @@ func TestHookExecutor_makeHookPodRestart(t *testing.T) {
 	if err := legacyscheme.Scheme.Convert(&config.Spec.Strategy, &newStrategy, nil); err != nil {
 		t.Fatalf("conversion error: %v", err)
 	}
-	pod, err := createHookPodManifest(hook, deployment, &newStrategy, "hook", nowFunc().Time)
+	pod, err := createHookPodManifest(
+		hook,
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: appsutil.DeployerPodNameForDeployment(deployment.Name),
+			UID:  "",
+		}},
+		deployment,
+		&newStrategy,
+		"hook",
+		nowFunc().Time)
 	if err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	}

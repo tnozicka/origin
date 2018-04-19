@@ -1099,11 +1099,7 @@ func TestDeployerCustomLabelsAndAnnotations(t *testing.T) {
 
 		controller := okDeploymentController(client, nil, nil, true, corev1.PodUnknown)
 
-		podTemplate, err := controller.makeDeployerPod(deployment)
-		if err != nil {
-			t.Fatal(err)
-		}
-
+		podTemplate := controller.makeDeployerPod(deployment, config)
 		nameLabel, ok := podTemplate.Labels[appsutil.DeployerPodForDeploymentLabel]
 		if ok && nameLabel != deployment.Name {
 			t.Errorf("label %s expected %s, got %s", appsutil.DeployerPodForDeploymentLabel, deployment.Name, nameLabel)
@@ -1180,11 +1176,7 @@ func TestMakeDeployerPod(t *testing.T) {
 		f.Fuzz(&inputPodTemplate)
 		deployment.Spec.Template = inputPodTemplate
 
-		outputPodTemplate, err := controller.makeDeployerPod(deployment)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-
+		outputPodTemplate := controller.makeDeployerPod(deployment, config)
 		if !reflect.DeepEqual(inputPodTemplate.Spec, outputPodTemplate.Spec) {
 			t.Fatalf("Deployer pod is missing fields:\n%s\n\n%s",
 				diff.ObjectReflectDiff(inputPodTemplate.Spec, outputPodTemplate.Spec),

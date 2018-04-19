@@ -181,7 +181,7 @@ func DeploymentsForCleanup(configuration *appsv1.DeploymentConfig, deployments [
 		// the latest one
 		for i := range deployments {
 			deployment := deployments[i]
-			if deploymentVersionFor(deployment) != configuration.Status.LatestVersion {
+			if DeploymentVersionFor(deployment) != configuration.Status.LatestVersion {
 				relevantDeployments = append(relevantDeployments, *deployment)
 			}
 		}
@@ -190,7 +190,7 @@ func DeploymentsForCleanup(configuration *appsv1.DeploymentConfig, deployments [
 		// care about, namely the active deployment and any newer deployments
 		for i := range deployments {
 			deployment := deployments[i]
-			if deployment != activeDeployment && deploymentVersionFor(deployment) < deploymentVersionFor(activeDeployment) {
+			if deployment != activeDeployment && DeploymentVersionFor(deployment) < DeploymentVersionFor(activeDeployment) {
 				relevantDeployments = append(relevantDeployments, *deployment)
 			}
 		}
@@ -642,6 +642,28 @@ func int32AnnotationFor(obj runtime.Object, key string) (int32, bool) {
 	return int32(i), true
 }
 
+func MapDeployerPhaseToDeploymentPhase(deployerPod *v1.Pod) (DeploymentStatus, error) {
+	switch deployerPod.Status.Phase {
+	case v1.PodPending:
+		return DeploymentStatusPending, nil
+
+	case v1.PodRunning:
+		return DeploymentStatusRunning, nil
+
+	case v1.PodSucceeded:
+		return DeploymentStatusComplete, nil
+
+	case v1.PodFailed:
+		return DeploymentStatusFailed, nil
+
+	case v1.PodUnknown:
+		fallthrough
+	default:
+		return "", fmt.Errorf("deployer phase %q can't be mapped to deployment phase", deployerPod.Status.Phase)
+	}
+}
+
+// ByLatestVersionAsc sorts deployments by LatestVersion ascending.
 type ByLatestVersionAsc []*v1.ReplicationController
 
 func (d ByLatestVersionAsc) Len() int      { return len(d) }
