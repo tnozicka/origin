@@ -15,6 +15,8 @@ const (
 	DeploymentStatusRunning DeploymentStatus = "Running"
 	// DeploymentStatusCanceling means the deployment is being canceled.
 	DeploymentStatusCanceling DeploymentStatus = "Canceling"
+	// DeploymentStatusRetrying means the deployment is being retried.
+	DeploymentStatusRetrying DeploymentStatus = "Retrying"
 	// DeploymentStatusComplete means the deployment finished without an error.
 	DeploymentStatusComplete DeploymentStatus = "Complete"
 	// DeploymentStatusFailed means the deployment finished with an error.

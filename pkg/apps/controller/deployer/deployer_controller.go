@@ -101,21 +101,24 @@ func (c *DeploymentController) makeStateTransitionForCancelled(deployment *corev
 	deployerPodName := appsutil.DeployerPodNameForDeployment(deployment.Name)
 
 	switch currentState {
-	case appsutil.DeploymentStatusNew, appsutil.DeploymentStatusPending, appsutil.DeploymentStatusRunning:
-		if !(deployerPodFound && deployerPod.DeletionTimestamp != nil) {
-			propagationPolicyForeground := metav1.DeletePropagationForeground
-			err := c.pn.Pods(deployment.Namespace).Delete(deployerPodName, &metav1.DeleteOptions{
-				Preconditions: &metav1.Preconditions{
-					UID: &deployerPod.UID,
-				},
-				// We need to wait for dependant's deletion here. Like if deployer pod have already created
-				// some hooks we want to be sure those are deleted (and stopped) too.
-				PropagationPolicy: &propagationPolicyForeground,
-			})
-			if err != nil && !kerrors.IsNotFound(err) {
-				return "", fmt.Errorf("failed to delete deplyoer pod %s/%s: %v", deployment.Namespace, deployerPodName, err)
-			}
+	case appsutil.DeploymentStatusNew, appsutil.DeploymentStatusPending, appsutil.DeploymentStatusRunning, appsutil.DeploymentStatusRetrying:
+		if deployerPodFound && deployerPod.DeletionTimestamp != nil {
+			return appsutil.DeploymentStatusCanceling, nil
 		}
+
+		propagationPolicyForeground := metav1.DeletePropagationForeground
+		err := c.pn.Pods(deployment.Namespace).Delete(deployerPodName, &metav1.DeleteOptions{
+			Preconditions: &metav1.Preconditions{
+				UID: &deployerPod.UID,
+			},
+			// We need to wait for dependant's deletion here. Like if deployer pod have already created
+			// some hooks we want to be sure those are deleted (and stopped) too.
+			PropagationPolicy: &propagationPolicyForeground,
+		})
+		if err != nil && !kerrors.IsNotFound(err) {
+			return "", fmt.Errorf("failed to delete deployer pod %s/%s: %v", deployment.Namespace, deployerPodName, err)
+		}
+
 		return appsutil.DeploymentStatusCanceling, nil
 
 	case appsutil.DeploymentStatusCanceling:
@@ -183,6 +186,11 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 		generatedDeployerPod := c.makeDeployerPod(deployment, dcReadOnly)
 
 		// Create the deployer pod.
+		// This might be attempted to be created more than once as we might fail to update deployment
+		// phase on conflict or pod informers are slowed down and we don't see the pod created yet.
+		// Could be handled by expectations (ttl cache) if that would produce excessive errors frequently.
+		// In the common flow pod informers see the pod being created before the update on deployment state is finished
+		// so this should be fine in most cases and the side effects are mild.
 		var err error
 		deployerPod, err = c.pn.Pods(deployment.Namespace).Create(generatedDeployerPod)
 		if err != nil {
@@ -194,13 +202,9 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 
 		glog.V(4).Infof("Created deployer pod %q for %q", deployerPod.Name, appsutil.LabelForDeployment(deployment))
 
-		updatedAnnotations[appsutil.DeploymentPodAnnotation] = deployerPod.Name
-		updatedAnnotations[appsutil.DeployerPodCreatedAtAnnotation] = deployerPod.CreationTimestamp.String()
-		if deployerPod.Status.StartTime != nil {
-			updatedAnnotations[appsutil.DeployerPodStartedAtAnnotation] = deployerPod.Status.StartTime.String()
-		}
-
-		return appsutil.DeploymentStatusPending, nil
+		// We need to stay in New phase until our informers see the pod being created
+		// otherwise the following state might fail prematurely.
+		return appsutil.DeploymentStatusNew, nil
 
 	case appsutil.DeploymentStatusPending, appsutil.DeploymentStatusRunning:
 		if !deployerPodFound {
@@ -222,6 +226,28 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 
 	case appsutil.DeploymentStatusComplete, appsutil.DeploymentStatusFailed:
 		return currentState, nil
+
+	case appsutil.DeploymentStatusRetrying:
+		if !deployerPodFound {
+			delete(updatedAnnotations, appsutil.DeploymentStatusReasonAnnotation)
+			delete(updatedAnnotations, appsutil.DeploymentCancelledAnnotation)
+			return appsutil.DeploymentStatusNew, nil
+		}
+
+		// Delete dependants first so we are sure e.g. hooks are already deleted
+		foregroundPropagation := metav1.DeletePropagationForeground
+		zero := int64(0)
+		err := c.pn.Pods(deployerPod.Namespace).Delete(deployerPod.Name, &metav1.DeleteOptions{
+			PropagationPolicy:  &foregroundPropagation,
+			GracePeriodSeconds: &zero,
+		})
+		if err != nil && !kerrors.IsNotFound(err) {
+			return "", nil
+		}
+
+		// We need to stay in Retrying phase until our informers see the pod being created
+		// otherwise the following state might fail prematurely.
+		return appsutil.DeploymentStatusRetrying, nil
 
 	default:
 		return "", fmt.Errorf("unexpected deployment state: %q", currentState)
@@ -268,6 +294,12 @@ func (c *DeploymentController) handle(deploymentReadOnly *corev1.ReplicationCont
 		if err != nil {
 			return fmt.Errorf("failed to make state transition for regular deployment %s/%s: %v", deploymentReadOnly.Namespace, deploymentReadOnly.Name, err)
 		}
+	}
+
+	updatedAnnotations[appsutil.DeploymentPodAnnotation] = deployerPod.Name
+	updatedAnnotations[appsutil.DeployerPodCreatedAtAnnotation] = deployerPod.CreationTimestamp.String()
+	if deployerPod.Status.StartTime != nil {
+		updatedAnnotations[appsutil.DeployerPodStartedAtAnnotation] = deployerPod.Status.StartTime.String()
 	}
 
 	updatedAnnotations[appsutil.DeploymentStatusAnnotation] = string(nextState)

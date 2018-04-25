@@ -174,7 +174,7 @@ func checkDeploymentInvariants(dc *appsv1.DeploymentConfig, rcs []*corev1.Replic
 				if sawStatus.Difference(completedStatuses).Len() != 0 {
 					return fmt.Errorf("rc %s was %s, but earlier RCs were not completed: %v", rc.Name, status, statuses)
 				}
-			case appsutil.DeploymentStatusRunning, appsutil.DeploymentStatusPending:
+			case appsutil.DeploymentStatusRunning, appsutil.DeploymentStatusPending, appsutil.DeploymentStatusCanceling:
 				if sawStatus.Has(string(status)) {
 					return fmt.Errorf("rc %s was %s, but so was an earlier RC: %v", rc.Name, status, statuses)
 				}
