@@ -83,7 +83,7 @@ type DeploymentConfigController struct {
 }
 
 // Handle implements the loop that processes deployment configs. Since this controller started
-// using caches, the provided config MUST be deep-copied beforehand (see work() in factory.go).
+// using caches, the provided config MUST be deep-copied beforehand (see work() in deploymentconfig_factory.go).
 func (c *DeploymentConfigController) Handle(config *appsv1.DeploymentConfig) error {
 	glog.V(5).Infof("Reconciling %s/%s", config.Namespace, config.Name)
 	// There's nothing to reconcile until the version is nonzero.

@@ -191,24 +191,35 @@ func (o RetryOptions) Run() error {
 			continue
 		}
 
-		// Delete the deployer pod as well as the deployment hooks pods, if any
-		pods, err := o.Clientset.Core().Pods(config.Namespace).List(metav1.ListOptions{LabelSelector: appsutil.DeployerPodSelector(
-			latestDeploymentName).String()})
+		// Delete deployer pod, use foreground deletion so we are sure that dependants (like hooks) are deleted at this point.
+		// Any hooks created shall have the controllerRef set to the deployer who created them.
+		deployerPodName := appsutil.DeployerPodNameForDeployment(rc.Name)
+		foregroundPropagation := metav1.DeletePropagationForeground
+		zero := int64(0)
+		err = o.Clientset.Core().Pods(rc.Namespace).Delete(deployerPodName, &metav1.DeleteOptions{
+			PropagationPolicy:  &foregroundPropagation,
+			GracePeriodSeconds: &zero,
+		})
 		if err != nil {
-			allErrs = append(allErrs, kcmdutil.AddSourceToErr("retrying", info.Source, fmt.Errorf("failed to list deployer/hook pods for deployment #%d: %v", config.Status.LatestVersion, err)))
+			allErrs = append(allErrs, kcmdutil.AddSourceToErr("retrying", info.Source, fmt.Errorf("failed to delete deployer pod for deployment #%d: %v", config.Status.LatestVersion, err)))
 			continue
 		}
-		hasError := false
-		for _, pod := range pods.Items {
-			err := o.Clientset.Core().Pods(pod.Namespace).Delete(pod.Name, metav1.NewDeleteOptions(0))
-			if err != nil {
-				allErrs = append(allErrs, kcmdutil.AddSourceToErr("retrying", info.Source, fmt.Errorf("failed to delete deployer/hook pod %s for deployment #%d: %v", pod.Name, config.Status.LatestVersion, err)))
-				hasError = true
-			}
-		}
-		if hasError {
+
+		// For compatibility reasons delete the hooks pods as well.
+		// TODO: Drop in 3.11; 3.10 fixed hooks owner refs to point to the deployer that have created them
+		err = o.Clientset.Core().Pods(config.Namespace).DeleteCollection(&metav1.DeleteOptions{
+			GracePeriodSeconds: &zero,
+		},
+			metav1.ListOptions{
+				LabelSelector: appsutil.DeployerPodSelector(latestDeploymentName).String(),
+			},
+		)
+		if err != nil {
+			allErrs = append(allErrs, kcmdutil.AddSourceToErr("retrying", info.Source, fmt.Errorf("failed to delete deployer/hook pods for deployment #%d: %v", config.Status.LatestVersion, err)))
 			continue
 		}
+
+		// We need to wait for the deployer artifacts to be deleted or the controller may see failed pods and transition
 
 		patches := set.CalculatePatchesExternal([]*resource.Info{{Object: rc, Mapping: mapping}}, func(info *resource.Info) (bool, error) {
 			rc.Annotations[appsv1.DeploymentStatusAnnotation] = string(appsv1.DeploymentStatusNew)

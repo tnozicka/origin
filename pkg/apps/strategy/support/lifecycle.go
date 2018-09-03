@@ -201,7 +201,7 @@ func (e *hookExecutor) executeExecNewPod(hook *appsv1.LifecycleHook, rc *corev1.
 	}
 
 	// Build a pod spec from the hook config and replication controller.
-	podSpec, err := createHookPodManifest(hook, rc, &config.Spec.Strategy, suffix, startTime)
+	podSpec, err := createHookPodManifest(hook, deployerPod, rc, &config.Spec.Strategy, suffix, startTime)
 	if err != nil {
 		return err
 	}
@@ -306,10 +306,9 @@ func (e *hookExecutor) readPodLogs(pod *corev1.Pod, wg *sync.WaitGroup) {
 	}
 }
 
-func createHookPodManifest(hook *appsv1.LifecycleHook, rc *corev1.ReplicationController, strategy *appsv1.DeploymentStrategy,
+func createHookPodManifest(hook *appsv1.LifecycleHook, deployerPod *corev1.Pod, rc *corev1.ReplicationController, strategy *appsv1.DeploymentStrategy,
 	hookType string,
 	startTime time.Time) (*corev1.Pod, error) {
-
 	exec := hook.ExecNewPod
 
 	var baseContainer *corev1.Container
@@ -387,6 +386,7 @@ func createHookPodManifest(hook *appsv1.LifecycleHook, rc *corev1.ReplicationCon
 	podSecurityContextCopy := rc.Spec.Template.Spec.SecurityContext.DeepCopy()
 	securityContextCopy := baseContainer.SecurityContext.DeepCopy()
 
+	trueVar := true
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      apihelpers.GetPodName(rc.Name, hookType),
@@ -397,6 +397,19 @@ func createHookPodManifest(hook *appsv1.LifecycleHook, rc *corev1.ReplicationCon
 			Labels: map[string]string{
 				appsv1.DeployerPodForDeploymentLabel: rc.Name,
 				deploymentPodTypeLabel:               hookType,
+			},
+			// Deployer pod is the controller managing hooks.
+			// Also if deployer is aborted by deletion with propagation policy foreground, it will abort the hooks.
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: "v1",
+					Name:       deployerPod.Name,
+					Kind:       kapi.Kind("Pod").Kind,
+					UID:        deployerPod.UID,
+					Controller: &trueVar,
+					// TODO: check if this is still needed
+					BlockOwnerDeletion: &trueVar,
+				},
 			},
 		},
 		Spec: corev1.PodSpec{

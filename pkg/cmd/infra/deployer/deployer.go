@@ -11,9 +11,13 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	kv1core "k8s.io/client-go/kubernetes/typed/core/v1"
 	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	kapi "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/kubectl"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/templates"
@@ -97,34 +101,67 @@ func (cfg *config) RunDeployer() error {
 	if len(cfg.rcName) == 0 {
 		return fmt.Errorf("--deployment or OPENSHIFT_DEPLOYMENT_NAME is required")
 	}
+
 	if len(cfg.Namespace) == 0 {
 		return fmt.Errorf("--namespace or OPENSHIFT_DEPLOYMENT_NAMESPACE is required")
 	}
 
-	kcfg, err := restclient.InClusterConfig()
+	kubeConfig, err := restclient.InClusterConfig()
 	if err != nil {
 		return err
 	}
-	openshiftImageClient, err := imageclientv1.NewForConfig(kcfg)
+
+	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
 		return err
 	}
-	kubeClient, err := kubernetes.NewForConfig(kcfg)
+
+	openshiftImageClient, err := imageclientv1.NewForConfig(kubeConfig)
 	if err != nil {
 		return err
 	}
+
+	startTimeString, startTimeOk := os.LookupEnv("OPENSHIFT_POD_STARTTIME")
+	activeDeadlineSecString, activeDeadliveSecOk := os.LookupEnv("OPENSHIFT_POD_ACTIVEDEADLINESEC")
+
+	// Only one is set
+	if startTimeOk != activeDeadliveSecOk {
+		return fmt.Errorf("only one of OPENSHIFT_POD_STARTTIME and OPENSHIFT_POD_ACTIVEDEADLINESEC is set")
+	}
+
+	if startTimeOk && activeDeadliveSecOk {
+		startTime, err := time.Parse(time.RFC3339, startTimeString)
+		if err != nil {
+			return err
+		}
+
+		activeDeadline, err := time.ParseDuration(activeDeadlineSecString)
+		if err != nil {
+			return err
+		}
+
+		// TODO: Move watchdogs to a side car when OpenShift supports `shareProcessNamespace`
+		// (to be able to send a kill signal from a side car to deployer container)
+		// to support custom strategies as well.
+		go timeWatchdog(startTime, activeDeadline, cfg.ErrOut)
+	}
+
+	// TODO: Move watchdogs to a side car when OpenShift supports `shareProcessNamespace`
+	// (to be able to send a kill signal from a side car to deployer container)
+	// to support custom strategies as well.
+	go deploymentWatchdog(kubeClient, cfg.Namespace, cfg.rcName, cfg.ErrOut)
 
 	deployer := NewDeployer(kubeClient, openshiftImageClient, cfg.Out, cfg.ErrOut, cfg.Until)
 	return deployer.Deploy(cfg.Namespace, cfg.rcName)
 }
 
 // NewDeployer makes a new Deployer from a kube client.
-func NewDeployer(kubeClient kubernetes.Interface, images imageclientv1.Interface, out, errOut io.Writer,
-	until string) *Deployer {
+func NewDeployer(kubeClient kubernetes.Interface, images imageclientv1.Interface, out, errOut io.Writer, until string) *Deployer {
 	return &Deployer{
-		out:    out,
-		errOut: errOut,
-		until:  until,
+		out:        out,
+		errOut:     errOut,
+		until:      until,
+		kubeClient: kubeClient,
 		getDeployment: func(namespace, name string) (*corev1.ReplicationController, error) {
 			return kubeClient.CoreV1().ReplicationControllers(namespace).Get(name, metav1.GetOptions{})
 		},
@@ -163,6 +200,8 @@ type Deployer struct {
 	out, errOut io.Writer
 	// until is a condition to run until
 	until string
+	// kubeClient is the kubernetes clientset
+	kubeClient kubernetes.Interface
 	// strategyFor returns a DeploymentStrategy for config.
 	strategyFor func(config *appsv1.DeploymentConfig) (strategy.DeploymentStrategy, error)
 	// getDeployment finds the named deployment.
@@ -260,5 +299,74 @@ func (d *Deployer) Deploy(namespace, rcName string) error {
 		return err
 	}
 	fmt.Fprintln(d.out, "--> Success")
+	return nil
+}
+
+// timeWatchdog checks that we don't exceed maxDuration (activeDeadlineSec) even in a case when kubelet gets borked
+// and we are still running to maintain invariants because the controller will consider the deployment failed and times out.
+// Timeouting is necessary for cases when the node running deployer gets notReady and may not come back.
+func timeWatchdog(startTime time.Time, maxDuration time.Duration, errOut io.Writer) {
+	return
+	for {
+		if time.Since(startTime) > maxDuration {
+			fmt.Fprintf(errOut, "Running time exceeded! Exiting.")
+			os.Exit(1)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func deploymentWatchdogCheckDeployment(deployment *corev1.ReplicationController, errOut io.Writer) {
+	deploymentState := appsutil.DeploymentStatusFor(deployment)
+	switch deploymentState {
+	case appsv1.DeploymentStatusCanceling, appsv1.DeploymentStatusComplete, appsv1.DeploymentStatusFailed:
+		fmt.Fprintf(errOut, "Detected owning deployment %s/%s in state %q! Exiting.", deployment.Namespace, deployment.Name, deploymentState)
+		os.Exit(1)
+	}
+}
+
+// deploymentWatchdog makes sure we don't act on terminated or canceling deployments.
+// It exits the program if we do.
+func deploymentWatchdog(kubeClient kubernetes.Interface, namespace string, name string, errOut io.Writer) error {
+	return nil
+	deployment, err := kubeClient.CoreV1().ReplicationControllers(namespace).Get(name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	setupOptions := func(options *metav1.ListOptions) {
+		options.FieldSelector = fields.AndSelectors(
+			fields.OneTermEqualSelector("metadata.name", deployment.Name),
+			fields.OneTermEqualSelector("metadata.uid", string(deployment.UID)),
+		).String()
+	}
+
+	lw := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			setupOptions(&options)
+			return kubeClient.CoreV1().ReplicationControllers(namespace).List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			setupOptions(&options)
+			return kubeClient.CoreV1().ReplicationControllers(namespace).Watch(options)
+		},
+	}
+
+	_, informer := cache.NewIndexerInformer(lw, &corev1.ReplicationController{}, 0, cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			deploymentWatchdogCheckDeployment(obj.(*corev1.ReplicationController), errOut)
+		},
+		UpdateFunc: func(old, new interface{}) {
+			deploymentWatchdogCheckDeployment(new.(*corev1.ReplicationController), errOut)
+		},
+		DeleteFunc: func(obj interface{}) {
+			fmt.Fprintf(errOut, "Owning deployment %s/%s has been deleted! Exiting.", deployment.Namespace, deployment.Name)
+			os.Exit(1)
+		},
+	}, cache.Indexers{})
+
+	informer.Run(make(chan struct{}))
+
 	return nil
 }
