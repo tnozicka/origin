@@ -318,10 +318,13 @@ func timeWatchdog(startTime time.Time, maxDuration time.Duration, errOut io.Writ
 }
 
 func deploymentWatchdogCheckDeployment(deployment *corev1.ReplicationController, errOut io.Writer) {
-	deploymentState := appsutil.DeploymentStatusFor(deployment)
-	switch deploymentState {
-	case appsv1.DeploymentStatusCanceling, appsv1.DeploymentStatusComplete, appsv1.DeploymentStatusFailed:
-		fmt.Fprintf(errOut, "Detected owning deployment %s/%s in state %q! Exiting.", deployment.Namespace, deployment.Name, deploymentState)
+	if appsutil.IsTerminatedDeployment(deployment) {
+		fmt.Fprintf(errOut, "Detected owning deployment %s/%s to be terminated as %q! Exiting.", deployment.Namespace, deployment.Name, appsutil.DeploymentStatusFor(deployment))
+		os.Exit(1)
+	}
+
+	if appsutil.IsDeploymentCancelled(deployment) {
+		fmt.Fprintf(errOut, "Detected owning deployment %s/%s to be canceled! Exiting.", deployment.Namespace, deployment.Name)
 		os.Exit(1)
 	}
 }

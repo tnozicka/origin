@@ -221,6 +221,8 @@ func (o RetryOptions) Run() error {
 
 		// We need to wait for the deployer artifacts to be deleted or the controller may see failed pods and transition
 
+		// FIXME: this needs to use update based on current state actually being "Failed" otherwise this is a race
+
 		patches := set.CalculatePatchesExternal([]*resource.Info{{Object: rc, Mapping: mapping}}, func(info *resource.Info) (bool, error) {
 			rc.Annotations[appsv1.DeploymentStatusAnnotation] = string(appsv1.DeploymentStatusNew)
 			delete(rc.Annotations, appsv1.DeploymentStatusReasonAnnotation)

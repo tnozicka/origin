@@ -9,53 +9,34 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	kutilerrors "k8s.io/apimachinery/pkg/util/errors"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/apimachinery/pkg/util/strategicpatch"
-	kcoreclient "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/kubernetes"
 	kcorelisters "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	"k8s.io/kubernetes/pkg/controller"
 
 	appsv1 "github.com/openshift/api/apps/v1"
 	appsutil "github.com/openshift/origin/pkg/apps/util"
 	"github.com/openshift/origin/pkg/util"
 )
 
-// maxRetryCount is the maximum number of times the controller will retry errors.
-// The first requeue is after 5ms and subsequent requeues grow exponentially.
-// This effectively can extend up to 5*2^14ms which caps to 82s:
-//
-// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.3s, 2.6s, 5.1s, 10.2s, 20.4s, 41s, 82s
-//
-//
-// The most common errors are:
-//
-// * failure to delete the deployer pods
-// * failure to update the replication controller
-// * pod may be missing from the cache once the deployment transitions to Pending.
-//
-// In most cases, we shouldn't need to retry up to maxRetryCount...
-const maxRetryCount = 15
+const (
+	// maxRetryCount is the maximum number of times the controller will retry errors.
+	// The first requeue is after 5ms and subsequent requeues grow exponentially.
+	// This effectively can extend up to 5*2^14ms which caps to 82s:
+	//
+	// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.3s, 2.6s, 5.1s, 10.2s, 20.4s, 41s, 82s
+	maxRetryCount = 15
 
-// maxInjectedEnvironmentAllowedSize represents maximum size of a value of environment variable
-// that we will inject to a container. The default is 128Kb.
-const maxInjectedEnvironmentAllowedSize = 1000 * 128
+	// maxInjectedEnvironmentAllowedSize represents maximum size of a value of environment variable
+	// that we will inject to a container. The default is 128Kb.
+	maxInjectedEnvironmentAllowedSize = 1000 * 128
+)
 
-// fatalError is an error which can't be retried.
-type fatalError string
-
-func (e fatalError) Error() string { return "fatal error handling rollout: " + string(e) }
-
-// actionableError is an error on which users can act.
-type actionableError string
-
-func (e actionableError) Error() string { return string(e) }
+// controllerKind contains the schema.GroupVersionKind for this controller type.
+var controllerKind = appsv1.GroupVersion.WithKind("ReplicationController")
 
 // DeploymentController starts a deployment by creating a deployer pod which
 // implements a deployment strategy. The status of the deployment will follow
@@ -67,10 +48,7 @@ func (e actionableError) Error() string { return string(e) }
 //   1. If the deployment finished normally, the deployer pod is deleted.
 //   2. If the deployment failed, the deployer pod is not deleted.
 type DeploymentController struct {
-	// rn is used for updating replication controllers.
-	rn kcoreclient.ReplicationControllersGetter
-	// pn is used for creating, updating, and deleting deployer pods.
-	pn kcoreclient.PodsGetter
+	kubeClient kubernetes.Interface
 
 	// queue contains replication controllers that need to be synced.
 	queue workqueue.RateLimitingInterface
@@ -97,17 +75,27 @@ type DeploymentController struct {
 
 func (c *DeploymentController) makeStateTransitionForCancelled(deployment *corev1.ReplicationController, deployerPod *corev1.Pod, dcReadOnly *appsv1.DeploymentConfig, updatedAnnotations map[string]string) (appsv1.DeploymentStatus, error) {
 	deployerPodFound := deployerPod != nil
+	deployerFinished := deployerPodFound && appsutil.IsDeployerTerminated(deployerPod)
 	currentState := appsutil.DeploymentStatusFor(deployment)
-	deployerPodName := appsutil.DeployerPodNameForDeployment(deployment.Name)
 
 	switch currentState {
 	case appsv1.DeploymentStatusNew, appsv1.DeploymentStatusPending, appsv1.DeploymentStatusRunning, appsv1.DeploymentStatusRetrying:
-		if deployerPodFound && deployerPod.DeletionTimestamp != nil {
-			return appsv1.DeploymentStatusCanceling, nil
+		// We need to respect timeout while waiting for cancelation. Pods may never get deleted (e.g. if the node is down).
+		if appsutil.RolloutExceededTimeoutSeconds(dcReadOnly, deployment) {
+			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "CancellationTimeout",
+				fmt.Sprintf("Cancellation failed to wait for deployer pod %s/%s to be deleted", deployment.Namespace, deployerPod.Name))
+			return appsv1.DeploymentStatusFailed, nil
 		}
 
+		// If the deployer is already deleted we wait till the pod gets removed from etcd,
+		// causing a transition to a terminal state
+		if deployerPodFound && deployerPod.DeletionTimestamp != nil {
+			return currentState, nil
+		}
+
+		// FIXME: wrap with deletion expectations
 		propagationPolicyForeground := metav1.DeletePropagationForeground
-		err := c.pn.Pods(deployment.Namespace).Delete(deployerPodName, &metav1.DeleteOptions{
+		err := c.kubeClient.CoreV1().Pods(deployment.Namespace).Delete(deployerPod.Name, &metav1.DeleteOptions{
 			Preconditions: &metav1.Preconditions{
 				UID: &deployerPod.UID,
 			},
@@ -116,34 +104,18 @@ func (c *DeploymentController) makeStateTransitionForCancelled(deployment *corev
 			PropagationPolicy: &propagationPolicyForeground,
 		})
 		if err != nil && !kerrors.IsNotFound(err) {
-			return "", fmt.Errorf("failed to delete deployer pod %s/%s: %v", deployment.Namespace, deployerPodName, err)
+			return "", fmt.Errorf("failed to delete deployer pod %s/%s: %v", deployment.Namespace, deployerPod.Name, err)
 		}
 
-		return appsv1.DeploymentStatusCanceling, nil
+		c.emitDeploymentEvent(deployment, corev1.EventTypeNormal, "RolloutCancelled", fmt.Sprintf("Rollout for %q cancelled", appsutil.LabelForDeployment(deployment)))
 
-	case appsv1.DeploymentStatusCanceling:
-		if !deployerPodFound {
-			c.emitDeploymentEvent(deployment, corev1.EventTypeNormal, "RolloutCancelled", fmt.Sprintf("Rollout for %q cancelled", appsutil.LabelForDeployment(deployment)))
-			return appsv1.DeploymentStatusFailed, nil
-		}
-
-		if appsutil.RolloutExceededTimeoutSeconds(dcReadOnly, deployment) {
-			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "CancellationTimeout",
-				fmt.Sprintf("Cancellation failed to wait for deployer pod %s/%s to be deleted", deployment.Namespace, deployerPodName))
-			return appsv1.DeploymentStatusFailed, nil
-		}
-
-		return appsv1.DeploymentStatusCanceling, nil
-
-	case appsv1.DeploymentStatusFailed:
 		return appsv1.DeploymentStatusFailed, nil
 
-	case appsv1.DeploymentStatusComplete:
+	case appsv1.DeploymentStatusFailed, appsv1.DeploymentStatusComplete:
 		delete(updatedAnnotations, appsv1.DeploymentCancelledAnnotation)
 		delete(updatedAnnotations, appsv1.DeploymentStatusReasonAnnotation)
-		c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "FailedCancellation", "Succeeded before cancel recorded")
 
-		return appsv1.DeploymentStatusComplete, nil
+		return currentState, nil
 
 	default:
 		return "", fmt.Errorf("unexpected deployment state: %q", currentState)
@@ -156,43 +128,28 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 
 	switch currentState {
 	case appsv1.DeploymentStatusNew:
-		if deployerPodFound {
-			switch deployerPod.Status.Phase {
-			case corev1.PodUnknown:
-				return currentState, nil
-
-			default:
-				nextState, err := appsutil.MapDeployerPhaseToDeploymentPhase(deployerPod)
-				if err != nil {
-					return "", err
-				}
-
-				return nextState, nil
-			}
-		}
-
 		if _, ok := deployment.Annotations[appsutil.DeploymentIgnorePodAnnotation]; ok {
 			return appsv1.DeploymentStatusNew, nil
 		}
 
 		if appsutil.RolloutExceededTimeoutSeconds(dcReadOnly, deployment) {
 			updatedAnnotations[appsv1.DeploymentStatusReasonAnnotation] = appsutil.DeploymentFailedUnableToCreateDeployerPod
-			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "RolloutTimeout", fmt.Sprintf("Rollout for %q failed to create deployer pod (timeoutSeconds: %ds)", appsutil.LabelForDeployment(deployment), appsutil.GetTimeoutSecondsForStrategy(dcReadOnly)))
+			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "RolloutTimeout",
+				fmt.Sprintf("Rollout for %s/%s failed to create deployer pod (timeoutSeconds: %ds)", deployment.Namespace, deployment.Name, appsutil.GetTimeoutSecondsForStrategy(dcReadOnly)))
 
 			return appsv1.DeploymentStatusFailed, nil
+		}
+
+		if deployerPodFound {
+			return appsutil.MapDeployerPhaseToDeploymentPhaseOrStay(deployerPod, currentState)
 		}
 
 		// Generate a deployer pod.
 		generatedDeployerPod := c.makeDeployerPod(deployment, dcReadOnly)
 
-		// Create the deployer pod.
-		// This might be attempted to be created more than once as we might fail to update deployment
-		// phase on conflict or pod informers are slowed down and we don't see the pod created yet.
-		// Could be handled by expectations (ttl cache) if that would produce excessive errors frequently.
-		// In the common flow pod informers see the pod being created before the update on deployment state is finished
-		// so this should be fine in most cases and the side effects are mild.
+		// TODO: wrap by creation expectation
 		var err error
-		deployerPod, err = c.pn.Pods(deployment.Namespace).Create(generatedDeployerPod)
+		deployerPod, err = c.kubeClient.CoreV1().Pods(deployment.Namespace).Create(generatedDeployerPod)
 		if err != nil {
 			// if we cannot create a deployment pod (i.e lack of quota), match normal replica set experience and emit an event.
 			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "FailedCreate", fmt.Sprintf("Error creating deployer pod: %v", err))
@@ -211,18 +168,7 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 			return appsv1.DeploymentStatusFailed, nil
 		}
 
-		switch deployerPod.Status.Phase {
-		case corev1.PodUnknown:
-			return currentState, nil
-
-		default:
-			nextState, err := appsutil.MapDeployerPhaseToDeploymentPhase(deployerPod)
-			if err != nil {
-				return "", err
-			}
-
-			return nextState, nil
-		}
+		return appsutil.MapDeployerPhaseToDeploymentPhaseOrStay(deployerPod, currentState)
 
 	case appsv1.DeploymentStatusComplete, appsv1.DeploymentStatusFailed:
 		return currentState, nil
@@ -234,10 +180,11 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 			return appsv1.DeploymentStatusNew, nil
 		}
 
+		// TODO: protect by deletion expectation
 		// Delete dependants first so we are sure e.g. hooks are already deleted
 		foregroundPropagation := metav1.DeletePropagationForeground
 		zero := int64(0)
-		err := c.pn.Pods(deployerPod.Namespace).Delete(deployerPod.Name, &metav1.DeleteOptions{
+		err := c.kubeClient.CoreV1().Pods(deployerPod.Namespace).Delete(deployerPod.Name, &metav1.DeleteOptions{
 			PropagationPolicy:  &foregroundPropagation,
 			GracePeriodSeconds: &zero,
 		})
@@ -246,7 +193,8 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 		}
 
 		// We need to stay in Retrying phase until our informers see the pod being created
-		// otherwise the following state might fail prematurely.
+		// otherwise the following state might fail prematurely. It will automatically move
+		// the state when we manage to delete the old Pod.
 		return appsv1.DeploymentStatusRetrying, nil
 
 	default:
@@ -258,22 +206,42 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 // to a terminal deployment status. Since this controller started using caches,
 // the provided rc MUST be deep-copied beforehand (see work() in deployer_factory.go).
 func (c *DeploymentController) handle(deploymentReadOnly *corev1.ReplicationController, willBeDropped bool) error {
-	// Copy all the annotations from the deployment.
-	updatedAnnotations := make(map[string]string)
-	for key, value := range deploymentReadOnly.Annotations {
-		updatedAnnotations[key] = value
-	}
-
-	// FIXME: rename to state
-	currentStatus := appsutil.DeploymentStatusFor(deploymentReadOnly)
-
 	deployerPodName := appsutil.DeployerPodNameForDeployment(deploymentReadOnly.Name)
 	deployerPod, err := c.podLister.Pods(deploymentReadOnly.Namespace).Get(deployerPodName)
 	switch {
 	case err == nil:
-		// FIXME: validate ownerRefs, possibly fail immediately
+		// If any adoptions are attempted, we should first recheck for deletion with
+		// an uncached quorum read sometime after listing ReplicaSets (see #42639).
+		canAdoptFunc := controller.RecheckDeletionTimestamp(func() (metav1.Object, error) {
+			fresh, err := c.kubeClient.CoreV1().ReplicationControllers(deploymentReadOnly.Namespace).Get(deploymentReadOnly.Name, metav1.GetOptions{})
+			if err != nil {
+				return nil, err
+			}
+			if fresh.UID != deploymentReadOnly.UID {
+				return nil, fmt.Errorf("original Deployment %s/%s is gone: got uid %s, wanted %s", deploymentReadOnly.Namespace, deploymentReadOnly.Name, fresh.UID, deploymentReadOnly.UID)
+			}
+			return fresh, nil
+		})
+
+		cm := controller.NewPodControllerRefManager(
+			controller.RealPodControl{KubeClient: c.kubeClient, Recorder: c.recorder},
+			deploymentReadOnly,
+			appsutil.DeployerPodSelector(deploymentReadOnly.Name),
+			controllerKind,
+			canAdoptFunc,
+		)
+		claimedPods, err := cm.ClaimPods([]*corev1.Pod{deployerPod})
+		if err != nil {
+			return err
+		}
+		if len(claimedPods) != 1 {
+			return fmt.Errorf("internal error: expected to claim 1 pod, got %d", len(claimedPods))
+		}
+		deployerPod = claimedPods[0]
+
 	case kerrors.IsNotFound(err):
 		deployerPod = nil
+
 	default:
 		return fmt.Errorf("failed to get deployer pod %s/%s: %v", deploymentReadOnly.Namespace, deployerPodName, err)
 	}
@@ -283,7 +251,15 @@ func (c *DeploymentController) handle(deploymentReadOnly *corev1.ReplicationCont
 		return err
 	}
 
-	nextState := currentStatus
+	// Copy all the annotations from the deployment.
+	updatedAnnotations := make(map[string]string)
+	for key, value := range deploymentReadOnly.Annotations {
+		updatedAnnotations[key] = value
+	}
+
+	currentState := appsutil.DeploymentStatusFor(deploymentReadOnly)
+
+	nextState := currentState
 	if appsutil.IsDeploymentCancelled(deploymentReadOnly) {
 		nextState, err = c.makeStateTransitionForCancelled(deploymentReadOnly, deployerPod, dc, updatedAnnotations)
 		if err != nil {
@@ -297,6 +273,7 @@ func (c *DeploymentController) handle(deploymentReadOnly *corev1.ReplicationCont
 	}
 
 	updatedAnnotations[appsv1.DeploymentPodAnnotation] = deployerPod.Name
+	// TODO: remove; this is not needed since we keep the deployer pods
 	updatedAnnotations[appsv1.DeployerPodCreatedAtAnnotation] = deployerPod.CreationTimestamp.String()
 	if deployerPod.Status.StartTime != nil {
 		updatedAnnotations[appsv1.DeployerPodStartedAtAnnotation] = deployerPod.Status.StartTime.String()
@@ -317,14 +294,10 @@ func (c *DeploymentController) handle(deploymentReadOnly *corev1.ReplicationCont
 			}
 		}
 
-		if _, err := c.rn.ReplicationControllers(deployment.Namespace).Update(deployment); err != nil {
-			return fmt.Errorf("couldn't update rollout status for deployment %q to %s: %v", appsutil.LabelForDeployment(deployment), nextState, err)
+		if _, err := c.kubeClient.CoreV1().ReplicationControllers(deployment.Namespace).Update(deployment); err != nil {
+			return fmt.Errorf("couldn't update rollout state for deployment %q to %s: %v", appsutil.LabelForDeployment(deployment), nextState, err)
 		}
-		glog.V(4).Infof("Updated rollout status for deployment %q from %s to %s (scale: %d)", appsutil.LabelForDeployment(deployment), currentStatus, nextState, *deployment.Spec.Replicas)
-
-		if appsutil.IsDeploymentCancelled(deployment) && appsutil.IsFailedDeployment(deployment) {
-			c.emitDeploymentEvent(deployment, corev1.EventTypeNormal, "RolloutCancelled", fmt.Sprintf("Rollout for deployment %q cancelled", appsutil.LabelForDeployment(deployment)))
-		}
+		glog.V(4).Infof("Updated rollout state for deployment %q from %s to %s (scale: %d)", appsutil.LabelForDeployment(deployment), currentState, nextState, *deployment.Spec.Replicas)
 	}
 
 	return nil
@@ -469,76 +442,6 @@ func (c *DeploymentController) makeDeployerContainer(strategy *appsv1.Deployment
 	}
 }
 
-func (c *DeploymentController) getDeployerPods(deployment *corev1.ReplicationController) ([]*corev1.Pod, error) {
-	return c.podLister.Pods(deployment.Namespace).List(appsutil.DeployerPodSelector(deployment.Name))
-}
-
-func (c *DeploymentController) setDeployerPodsOwnerRef(deployment *corev1.ReplicationController) error {
-	deployerPodsList, err := c.getDeployerPods(deployment)
-	if err != nil {
-		return fmt.Errorf("couldn't fetch deployer pods for %q: %v", appsutil.LabelForDeployment(deployment), err)
-	}
-
-	encoder := legacyscheme.Codecs.LegacyCodec(legacyscheme.Scheme.PrioritizedVersionsAllGroups()...)
-	glog.V(4).Infof("deployment %s/%s owning %d pods", deployment.Namespace, deployment.Name, len(deployerPodsList))
-
-	var errors []error
-	for _, pod := range deployerPodsList {
-		if len(pod.OwnerReferences) > 0 {
-			continue
-		}
-		glog.V(4).Infof("setting ownerRef for pod %s/%s to deployment %s/%s", pod.Namespace, pod.Name, deployment.Namespace, deployment.Name)
-		newPod := pod.DeepCopy()
-		newPod.SetOwnerReferences([]metav1.OwnerReference{{
-			APIVersion: "v1",
-			Name:       deployment.Name,
-			Kind:       "ReplicationController",
-			UID:        deployment.UID,
-		}})
-		newPodBytes, err := runtime.Encode(encoder, newPod)
-		if err != nil {
-			errors = append(errors, err)
-			continue
-		}
-		oldPodBytes, err := runtime.Encode(encoder, pod)
-		if err != nil {
-			errors = append(errors, err)
-			continue
-		}
-		patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldPodBytes, newPodBytes, &corev1.Pod{})
-		if err != nil {
-			errors = append(errors, err)
-			continue
-		}
-		if _, err := c.pn.Pods(pod.Namespace).Patch(pod.Name, types.StrategicMergePatchType, patchBytes); err != nil {
-			errors = append(errors, err)
-		}
-	}
-	return kutilerrors.NewAggregate(errors)
-}
-
-func (c *DeploymentController) cleanupDeployerPods(deployment *corev1.ReplicationController) error {
-	deployerList, err := c.getDeployerPods(deployment)
-	if err != nil {
-		return fmt.Errorf("couldn't fetch deployer pods for %q: %v", appsutil.LabelForDeployment(deployment), err)
-	}
-
-	cleanedAll := true
-	for _, deployerPod := range deployerList {
-		if err := c.pn.Pods(deployerPod.Namespace).Delete(deployerPod.Name, &metav1.DeleteOptions{}); err != nil && !kerrors.IsNotFound(err) {
-			// if the pod deletion failed, then log the error and continue
-			// we will try to delete any remaining deployer pods and return an error later
-			utilruntime.HandleError(fmt.Errorf("couldn't delete completed deployer pod %q for %q: %v", deployerPod.Name, appsutil.LabelForDeployment(deployment), err))
-			cleanedAll = false
-		}
-	}
-
-	if !cleanedAll {
-		return actionableError(fmt.Sprintf("couldn't clean up all deployer pods for %q", appsutil.LabelForDeployment(deployment)))
-	}
-	return nil
-}
-
 func (c *DeploymentController) emitDeploymentEvent(deployment *corev1.ReplicationController, eventType, title, message string) {
 	if config, _ := appsutil.DecodeDeploymentConfig(deployment); config != nil {
 		c.recorder.Eventf(config, eventType, title, message)
@@ -553,12 +456,6 @@ func (c *DeploymentController) handleErr(err error, key interface{}, deployment 
 		return
 	}
 
-	if _, isFatal := err.(fatalError); isFatal {
-		utilruntime.HandleError(err)
-		c.queue.Forget(key)
-		return
-	}
-
 	if c.queue.NumRequeues(key) < maxRetryCount {
 		glog.Infof("Error syncing deployment %v: %v", key, err)
 
@@ -566,10 +463,6 @@ func (c *DeploymentController) handleErr(err error, key interface{}, deployment 
 		return
 	}
 
-	msg := fmt.Sprintf("Stop retrying: %v", err)
-	if _, isActionableErr := err.(actionableError); isActionableErr {
-		c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "FailedRetry", msg)
-	}
-	glog.V(2).Infof(msg)
+	glog.Warningf("Stopped retrying: %v", err)
 	c.queue.Forget(key)
 }

@@ -278,10 +278,6 @@ func TestHandle_createPodFail(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected an error")
 	}
-
-	if _, isFatal := err.(fatalError); isFatal {
-		t.Fatalf("expected a nonfatal error, got a %#v", err)
-	}
 }
 
 // TestHandle_deployerPodAlreadyExists ensures that attempts to create a
@@ -697,9 +693,6 @@ func TestHandle_cleanupPodFail(t *testing.T) {
 	err := controller.handle(deployment, false)
 	if err == nil {
 		t.Fatal("expected an actionable error")
-	}
-	if _, isActionable := err.(actionableError); !isActionable {
-		t.Fatalf("expected an actionable error, got %#v", err)
 	}
 }
 

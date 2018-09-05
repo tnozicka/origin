@@ -36,10 +36,8 @@ func NewDeployerController(
 	recorder := eventBroadcaster.NewRecorder(legacyscheme.Scheme, v1.EventSource{Component: "deployer-controller"})
 
 	c := &DeploymentController{
-		rn: kubeClientset.CoreV1(),
-		pn: kubeClientset.CoreV1(),
-
-		queue: workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		kubeClient: kubeClientset,
+		queue:      workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
 
 		rcLister:        rcInformer.Lister(),
 		rcListerSynced:  rcInformer.Informer().HasSynced,
