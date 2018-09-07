@@ -75,18 +75,30 @@ type DeploymentController struct {
 
 func (c *DeploymentController) makeStateTransitionForCancelled(deployment *corev1.ReplicationController, deployerPod *corev1.Pod, dcReadOnly *appsv1.DeploymentConfig, updatedAnnotations map[string]string) (appsv1.DeploymentStatus, error) {
 	deployerPodFound := deployerPod != nil
-	deployerFinished := deployerPodFound && appsutil.IsDeployerTerminated(deployerPod)
+	deployerPodName := appsutil.DeployerPodNameFor(deployment)
+	//deployerFinished := deployerPodFound && appsutil.IsDeployerTerminated(deployerPod)
 	currentState := appsutil.DeploymentStatusFor(deployment)
 
 	switch currentState {
-	case appsv1.DeploymentStatusNew, appsv1.DeploymentStatusPending, appsv1.DeploymentStatusRunning, appsv1.DeploymentStatusRetrying:
-		// We need to respect timeout while waiting for cancelation. Pods may never get deleted (e.g. if the node is down).
-		if appsutil.RolloutExceededTimeoutSeconds(dcReadOnly, deployment) {
-			c.emitDeploymentEvent(deployment, corev1.EventTypeWarning, "CancellationTimeout",
-				fmt.Sprintf("Cancellation failed to wait for deployer pod %s/%s to be deleted", deployment.Namespace, deployerPod.Name))
+	case appsv1.DeploymentStatusNew, appsv1.DeploymentStatusRetrying:
+		if deployerPodFound {
+			return appsv1.DeploymentStatusPending, nil
+		}
+
+		// We need to do  a live GET to find out if the deployer was created and the informers are just not caught up
+		_, err := c.kubeClient.CoreV1().Pods(deployment.Namespace).Get(deployerPodName, metav1.GetOptions{})
+		if err == nil {
+			// We have already created the deployer pod, need to wait for informers to catch up
+			return appsv1.DeploymentStatusNew, nil
+		}
+		if kerrors.IsNotFound(err) {
+			// We didn't create the deplyoer pod so we can just cancel
 			return appsv1.DeploymentStatusFailed, nil
 		}
 
+		return "", fmt.Errorf("failed to get deployer pod %s/%s: %v", deployment.Namespace, deployerPodName, err)
+
+	case appsv1.DeploymentStatusPending, appsv1.DeploymentStatusRunning:
 		// If the deployer is already deleted we wait till the pod gets removed from etcd,
 		// causing a transition to a terminal state
 		if deployerPodFound && deployerPod.DeletionTimestamp != nil {
@@ -95,7 +107,8 @@ func (c *DeploymentController) makeStateTransitionForCancelled(deployment *corev
 
 		// FIXME: wrap with deletion expectations
 		propagationPolicyForeground := metav1.DeletePropagationForeground
-		err := c.kubeClient.CoreV1().Pods(deployment.Namespace).Delete(deployerPod.Name, &metav1.DeleteOptions{
+
+		err := c.kubeClient.CoreV1().Pods(deployment.Namespace).Delete(deployerPodName, &metav1.DeleteOptions{
 			Preconditions: &metav1.Preconditions{
 				UID: &deployerPod.UID,
 			},
@@ -103,13 +116,19 @@ func (c *DeploymentController) makeStateTransitionForCancelled(deployment *corev
 			// some hooks we want to be sure those are deleted (and stopped) too.
 			PropagationPolicy: &propagationPolicyForeground,
 		})
-		if err != nil && !kerrors.IsNotFound(err) {
-			return "", fmt.Errorf("failed to delete deployer pod %s/%s: %v", deployment.Namespace, deployerPod.Name, err)
+		if err == nil {
+			c.emitDeploymentEvent(deployment, corev1.EventTypeNormal, "RolloutCancelled", fmt.Sprintf("Rollout for %q cancelled", appsutil.LabelForDeployment(deployment)))
+			// We need to wait for our informers to see the change
+			return currentState, nil
 		}
+		if kerrors.IsNotFound(err) {
+			// We need to wait for our informers to catch up
+			return appsv1.DeploymentStatusCanceling, nil
+			return currentState, nil
+		}
+		return "", fmt.Errorf("failed to delete deployer pod %s/%s: %v", deployment.Namespace, deployerPodName, err)
 
-		c.emitDeploymentEvent(deployment, corev1.EventTypeNormal, "RolloutCancelled", fmt.Sprintf("Rollout for %q cancelled", appsutil.LabelForDeployment(deployment)))
-
-		return appsv1.DeploymentStatusFailed, nil
+	case appsv1.DeploymentStatusCancelling:
 
 	case appsv1.DeploymentStatusFailed, appsv1.DeploymentStatusComplete:
 		delete(updatedAnnotations, appsv1.DeploymentCancelledAnnotation)
@@ -183,10 +202,8 @@ func (c *DeploymentController) makeStateTransitionRegular(deployment *corev1.Rep
 		// TODO: protect by deletion expectation
 		// Delete dependants first so we are sure e.g. hooks are already deleted
 		foregroundPropagation := metav1.DeletePropagationForeground
-		zero := int64(0)
 		err := c.kubeClient.CoreV1().Pods(deployerPod.Namespace).Delete(deployerPod.Name, &metav1.DeleteOptions{
-			PropagationPolicy:  &foregroundPropagation,
-			GracePeriodSeconds: &zero,
+			PropagationPolicy: &foregroundPropagation,
 		})
 		if err != nil && !kerrors.IsNotFound(err) {
 			return "", nil

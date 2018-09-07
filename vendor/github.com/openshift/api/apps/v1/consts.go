@@ -103,6 +103,9 @@ var (
 	// DeploymentStatusRetrying means the deployment is being retried.
 	DeploymentStatusRetrying DeploymentStatus = "Retrying"
 
+	// DeploymentStatusRetrying means the deployment is being retried.
+	DeploymentStatusRetrying DeploymentStatus = "Retrying"
+
 	// DeploymentStatusComplete means the deployment finished without an error.
 	DeploymentStatusComplete DeploymentStatus = "Complete"
 
