@@ -1,4 +1,4 @@
-package dr
+package etcd
 
 import (
 	"fmt"
